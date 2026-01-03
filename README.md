@@ -30,7 +30,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .zig_routines = .{
-        .url = "https://github.com/yourusername/zig-routines/archive/refs/tags/v0.1.0.tar.gz",
+        .url = "https://github.com/Edartruwu/zig-routines/archive/refs/tags/v0.1.0.tar.gz",
         .hash = "...",
     },
 },
