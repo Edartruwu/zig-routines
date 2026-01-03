@@ -1,29 +1,58 @@
 # zig-routines
 
-**A world-class concurrency library for Zig.**
+**Concurrency primitives for Zig, built on native OS threads.**
 
-Build any concurrency model: Go-style channels, Erlang-style actors, Rust-style futures, or Swift-style structured concurrency — all with Zig's explicit memory management and zero hidden allocations.
-
----
-
-## Features
-
-| Category                   | What You Get                                                         |
-| -------------------------- | -------------------------------------------------------------------- |
-| **Channels**               | Bounded, unbounded, broadcast, oneshot, select multiplexing          |
-| **Futures**                | Promises with `all`, `race`, `any`, `allSettled` combinators         |
-| **Actors**                 | Mailboxes, supervision trees, GenServer (OTP-style)                  |
-| **Structured Concurrency** | Scopes, task groups, cancellation tokens                             |
-| **Lock-free**              | MPMC queues, work-stealing deques, SPSC ring buffers, Treiber stacks |
-| **Schedulers**             | Thread pools, work-stealing schedulers                               |
-| **Async I/O**              | io_uring (Linux), kqueue (macOS), epoll fallback                     |
-| **Synchronization**        | Mutex, RwLock, Semaphore, Barrier, WaitGroup, Latch                  |
+A library providing composable building blocks for concurrent programming: channels, futures, supervision trees, lock-free data structures, and platform-optimized I/O. All primitives use explicit memory management with zero hidden allocations.
 
 ---
 
-## Quick Start
+## What This Library Is
 
-### Installation
+zig-routines is a **multi-paradigm concurrency primitives library**. It provides:
+
+1. **Synchronization primitives** — Mutexes, semaphores, barriers, wait groups
+2. **Communication channels** — Bounded/unbounded queues for thread-safe message passing
+3. **Lock-free data structures** — MPMC queues, work-stealing deques, SPSC ring buffers
+4. **Supervision patterns** — OTP-inspired restart strategies for fault tolerance
+5. **Structured concurrency** — Scopes and task groups with automatic cleanup
+6. **Platform-optimized I/O** — io_uring (Linux), kqueue (macOS), epoll fallback
+
+### Threading Model
+
+**All concurrency in zig-routines is built on native OS threads** (`std.Thread`). This means:
+
+- Each actor spawns a dedicated OS thread
+- Channels synchronize between OS threads using mutexes and condition variables
+- The work-stealing scheduler distributes tasks across a fixed thread pool
+
+This is fundamentally different from Erlang/BEAM, which runs millions of lightweight processes on a small number of OS threads with preemptive scheduling. zig-routines is better suited for:
+
+- **CPU-bound parallelism** — Distribute computation across cores
+- **Structured coordination** — Synchronize a bounded number of concurrent tasks
+- **Low-level control** — When you need explicit memory management and zero runtime overhead
+
+It is **not** designed for:
+
+- Running millions of concurrent connections (use an async runtime like io_uring directly)
+- Distributed systems (single-machine only)
+- Hot code reloading
+
+---
+
+## Quick Comparison
+
+| Aspect                | zig-routines         | Erlang/BEAM               | Go               | Tokio (Rust) |
+| --------------------- | -------------------- | ------------------------- | ---------------- | ------------ |
+| **Execution unit**    | OS thread            | Lightweight process       | Goroutine (M:N)  | Task (M:N)   |
+| **Concurrency scale** | ~100s of threads     | Millions of processes     | ~100K goroutines | ~100K tasks  |
+| **Memory model**      | Explicit allocators  | GC per process            | GC               | Ownership    |
+| **Scheduler**         | Work-stealing        | Preemptive, fair          | Preemptive       | Cooperative  |
+| **Distribution**      | None                 | Built-in                  | None             | None         |
+| **Use case**          | CPU-bound, low-level | I/O-bound, fault-tolerant | General          | Async I/O    |
+
+---
+
+## Installation
 
 Add to your `build.zig.zon`:
 
@@ -36,7 +65,7 @@ Add to your `build.zig.zon`:
 },
 ```
 
-Then in your `build.zig`:
+Then in `build.zig`:
 
 ```zig
 const zig_routines = b.dependency("zig_routines", .{
@@ -46,130 +75,161 @@ const zig_routines = b.dependency("zig_routines", .{
 exe.root_module.addImport("zig_routines", zig_routines.module("zig_routines"));
 ```
 
-### Basic Usage
-
-```zig
-const std = @import("std");
-const zr = @import("zig_routines");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Create a bounded channel
-    var ch = try zr.channel.BoundedChannel(u32).init(allocator, 10);
-    defer ch.deinit();
-
-    // Send and receive
-    try ch.send(42);
-    const value = try ch.recv();
-    std.debug.print("Received: {}\n", .{value});
-}
-```
-
 ---
 
-## Concurrency Models
+## Core Primitives
 
-### Channels (CSP)
+### Channels
 
-Go-style channels for safe communication between threads.
+Thread-safe FIFO queues for message passing between threads.
 
 ```zig
 const zr = @import("zig_routines");
 
-// Bounded channel (blocks when full)
+// Bounded channel — blocks sender when full
 var ch = try zr.channel.BoundedChannel(u32).init(allocator, 100);
 defer ch.deinit();
 
-// Producer
-try ch.send(1);
-try ch.send(2);
-try ch.send(3);
+// Producer thread
+try ch.send(42);
 
-// Consumer
-while (true) {
-    const msg = ch.tryRecv() catch break;
-    std.debug.print("Got: {}\n", .{msg});
-}
+// Consumer thread
+const value = try ch.recv();  // Blocks until message available
 
-// Close when done
 ch.close();
 ```
 
-**Unbounded channels** for when you don't want backpressure:
+**Implementation**: Ring buffer protected by mutex, with condition variables for blocking send/recv.
+
+**Variants**:
+
+- `BoundedChannel(T)` — Fixed capacity, backpressure via blocking
+- `UnboundedChannel(T)` — Linked list, no backpressure (memory grows)
+- `OneshotChannel(T)` — Single value transfer, like a one-shot promise
+
+---
+
+### Futures and Promises
+
+A value that will be available later, with polling or blocking access.
 
 ```zig
-var ch = try zr.channel.UnboundedChannel(Event).init(allocator);
-defer ch.deinit();
+const pair = try zr.future.Promise(u32).create(allocator);
+const promise = pair.promise;
+var future = pair.future;
+defer future.deinit();
+defer promise.deinit();
 
-try ch.send(.{ .type = .click, .x = 100, .y = 200 });
+// Producer resolves
+promise.resolve(42);
+
+// Consumer polls or blocks
+if (future.poll()) |value| {
+    // Ready
+}
+const value = try future.await();  // Blocking wait
 ```
 
-**Oneshot channels** for single-value transfer (like promises):
+**Combinators**:
+
+- `all(futures)` — Wait for all, fail fast on first error
+- `race(futures)` — Return first completed
+- `any(futures)` — Return first successful
+- `allSettled(futures)` — Collect all results regardless of success/failure
+
+---
+
+### Lock-Free Data Structures
+
+For high-contention scenarios where mutex overhead is unacceptable.
 
 ```zig
-const pair = try zr.channel.OneshotChannel(Result).init(allocator);
-defer pair.sender.deinit();
-defer pair.receiver.deinit();
+// Multi-producer multi-consumer bounded queue (Vyukov's algorithm)
+var queue = try zr.lockfree.MPMCQueue(*Task).init(allocator, 1024);
+try queue.push(&task);
+if (queue.pop()) |t| t.execute();
 
-// Producer sends exactly once
-try pair.sender.send(.{ .status = .ok, .data = payload });
+// Work-stealing deque (Chase-Lev algorithm)
+var deque = try zr.lockfree.WorkStealingDeque(*Task).init(allocator, 256);
+deque.push(&task);        // Owner: LIFO push/pop
+_ = deque.steal();        // Thieves: FIFO steal
 
-// Consumer receives exactly once
-const result = try pair.receiver.recv();
+// Single-producer single-consumer ring buffer (wait-free)
+var ring = try zr.lockfree.SPSCQueue(Event).init(allocator, 4096);
+```
+
+**Implementation details**:
+
+- MPMC uses per-slot sequence numbers with CAS
+- Work-stealing deque uses atomic indices with acquire/release ordering
+- Cache-line padding prevents false sharing
+
+---
+
+### Synchronization Primitives
+
+Standard concurrency building blocks.
+
+```zig
+// WaitGroup — wait for N tasks to complete
+var wg = zr.sync.WaitGroup.init();
+wg.add(3);
+// ... spawn threads that call wg.done()
+wg.wait();
+
+// Semaphore — limit concurrent access
+var sem = try zr.sync.Semaphore.init(allocator, 10);
+try sem.acquire();
+defer sem.release();
+
+// Barrier — synchronize N threads at a point
+var barrier = try zr.sync.Barrier.init(allocator, num_threads);
+try barrier.wait();  // All threads block until everyone arrives
 ```
 
 ---
 
-### Actors
+## Supervision Trees
 
-Erlang-style actors with message passing and supervision.
+Restart strategies for managing thread lifecycles, inspired by OTP but adapted for OS threads.
 
 ```zig
-const zr = @import("zig_routines");
+var sup = try zr.actor.Supervisor.init(allocator, .{
+    .strategy = .one_for_one,  // Restart only the failed child
+    .max_restarts = 3,         // Max 3 restarts...
+    .max_seconds = 5,          // ...within 5 seconds
+});
+defer sup.deinit();
 
-// Define an actor with message type, state type, and handler
-const CounterActor = zr.actor.Actor(
-    u32,    // Message type
-    u32,    // State type
-    struct {
-        pub fn handle(state: *u32, msg: u32) void {
-            state.* += msg;
-        }
-
-        pub fn onStart(state: *u32) void {
-            std.debug.print("Counter started at {}\n", .{state.*});
-        }
-
-        pub fn onStop(state: *u32) void {
-            std.debug.print("Final count: {}\n", .{state.*});
-        }
-    },
-);
-
-// Spawn the actor
-var actor = try CounterActor.spawn(allocator, 0);
-defer actor.stop();
-
-// Send messages
-try actor.send(5);
-try actor.send(10);
+try sup.startChild(.{
+    .id = "worker",
+    .start_fn = workerStart,
+    .restart = .permanent,     // Always restart
+});
 ```
 
-**GenServer** for request-response patterns:
+**Strategies**:
+
+- `one_for_one` — Restart only the failed child
+- `one_for_all` — Restart all children if one fails
+- `rest_for_one` — Restart failed child and all children started after it
+
+**Important difference from Erlang**: Each child runs in a dedicated OS thread. Supervision provides restart logic, not lightweight process isolation. There's no per-process garbage collection or memory isolation — a crash in one thread can corrupt shared state.
+
+---
+
+## GenServer Pattern
+
+Request-response server running in a dedicated thread.
 
 ```zig
 const CounterServer = zr.actor.GenServer(
-    i32,    // Request type (increment amount)
-    i32,    // Response type (new total)
-    void,   // Cast message type (unused)
+    i32,    // Request type
+    i32,    // Response type
+    void,   // Cast type (async messages)
     i32,    // State type
     struct {
-        pub fn init() i32 {
-            return 0;
-        }
+        pub fn init() i32 { return 0; }
 
         pub fn handleCall(state: *i32, request: i32) i32 {
             state.* += request;
@@ -181,226 +241,84 @@ const CounterServer = zr.actor.GenServer(
 var server = try CounterServer.start(allocator);
 defer server.stop();
 
-// Synchronous calls with responses
-const result1 = try server.call(5);   // Returns 5
-const result2 = try server.call(10);  // Returns 15
+const result = try server.call(5);   // Synchronous, returns 5
+try server.cast({});                  // Asynchronous, fire-and-forget
 ```
 
-**Supervision trees** for fault tolerance:
-
-```zig
-var sup = try zr.actor.Supervisor.init(allocator, .{
-    .strategy = .one_for_one,  // Restart only failed child
-    .max_restarts = 3,
-    .max_seconds = 5,
-});
-defer sup.deinit();
-
-try sup.startChild(.{
-    .id = "worker1",
-    .start_fn = workerStart,
-    .restart = .permanent,
-});
-```
-
-Supervision strategies:
-
-- **`one_for_one`**: Restart only the failed child
-- **`one_for_all`**: Restart all children if one fails
-- **`rest_for_one`**: Restart failed child and all children started after it
+**Implementation**: Spawns a thread that processes messages from a mailbox. `call` blocks the caller until response; `cast` returns immediately.
 
 ---
 
-### Futures & Promises
+## Structured Concurrency
 
-JavaScript-style async values with combinators.
-
-```zig
-const zr = @import("zig_routines");
-
-// Create a promise/future pair
-const pair = try zr.future.Promise(u32).create(allocator);
-const promise = pair.promise;
-var future = pair.future;
-defer future.deinit();
-defer promise.deinit();
-
-// Resolve from producer
-promise.resolve(42);
-
-// Poll from consumer
-if (future.poll()) |value| {
-    std.debug.print("Got: {}\n", .{value});
-}
-```
-
-**Combinators** for composing futures:
+Scopes that guarantee all spawned tasks complete before the scope exits.
 
 ```zig
-// Wait for all futures to complete
-const results = try zr.future.combinators.all(T, allocator, &futures);
-
-// Wait for first to complete
-const winner = try zr.future.combinators.race(T, allocator, &futures);
-
-// Wait for first successful result
-const first_ok = try zr.future.combinators.any(T, allocator, &futures);
-
-// Get all results (including failures)
-const settled = try zr.future.combinators.allSettled(T, allocator, &futures);
-```
-
----
-
-### Structured Concurrency
-
-Swift/Python Trio-style scopes for automatic cleanup.
-
-```zig
-const zr = @import("zig_routines");
-
 var scope = try zr.structured.Scope.init(allocator, .{});
 defer scope.deinit();
 
-// Spawn tasks in the scope
 try scope.spawn(fetchDataA, .{url_a});
 try scope.spawn(fetchDataB, .{url_b});
 
-// Wait for all tasks to complete
 try scope.wait();
-// All tasks guaranteed to be done here
+// All tasks guaranteed complete here
 ```
 
-**Task groups** for fork-join parallelism:
-
-```zig
-var group = try zr.structured.TaskGroup.init(allocator);
-defer group.deinit();
-
-// Fork
-try group.spawn(processChunk, .{chunk1});
-try group.spawn(processChunk, .{chunk2});
-try group.spawn(processChunk, .{chunk3});
-
-// Join
-group.wait();
-```
-
-**Cancellation tokens** for cooperative cancellation:
+**Cancellation**:
 
 ```zig
 var token = try zr.structured.CancelToken.init(allocator);
-defer token.deinit();
 
-// Pass to tasks
-try scope.spawn(longRunningTask, .{token});
+// In task:
+if (token.isCancelled()) return error.Cancelled;
 
-// Cancel from anywhere
+// From outside:
 token.cancel();
-
-// Tasks check cancellation
-if (token.isCancelled()) {
-    return error.Cancelled;
-}
 ```
 
 ---
 
-### Lock-free Data Structures
+## Platform-Optimized I/O
 
-High-performance concurrent collections.
+Completion-based async I/O with platform-specific backends.
 
-```zig
-const zr = @import("zig_routines");
-
-// Multi-producer multi-consumer queue
-var queue = try zr.lockfree.MPMCQueue(*Task).init(allocator, 1024);
-defer queue.deinit();
-
-try queue.push(&task);
-if (queue.pop()) |t| {
-    t.execute();
-}
-
-// Work-stealing deque (for schedulers)
-var deque = try zr.lockfree.WorkStealingDeque(*Task).init(allocator, 256);
-defer deque.deinit();
-
-deque.push(&task);           // Owner pushes
-const stolen = deque.steal(); // Thieves steal
-
-// SPSC ring buffer (single-producer single-consumer)
-var ring = try zr.lockfree.SPSCQueue(Event).init(allocator, 4096);
-defer ring.deinit();
-```
-
----
-
-### Thread Pool & Schedulers
+| Platform         | Backend  | Notes                          |
+| ---------------- | -------- | ------------------------------ |
+| Linux            | io_uring | Kernel 5.1+, zero-copy capable |
+| Linux (fallback) | epoll    | Edge-triggered                 |
+| macOS/BSD        | kqueue   | Kevent-based                   |
+| Other            | Threaded | Thread pool fallback           |
 
 ```zig
-const zr = @import("zig_routines");
+const io = try zr.io.Io.init(allocator, .{});
+defer io.deinit();
 
-// Simple thread pool
-var pool = try zr.scheduler.ThreadPool.init(allocator, .{
-    .thread_count = 8,
+try io.submit(.{
+    .op = .read,
+    .fd = socket_fd,
+    .buffer = buffer,
+    .callback = onComplete,
 });
-defer pool.deinit();
 
-try pool.spawn(&task);
-pool.waitIdle();
+io.poll();  // Process completions
+```
 
-// Work-stealing scheduler (better load balancing)
+---
+
+## Work-Stealing Scheduler
+
+Distributes tasks across worker threads with automatic load balancing.
+
+```zig
 var scheduler = try zr.scheduler.WorkStealingScheduler.init(allocator, .{
-    .thread_count = 0,  // Auto-detect CPU count
+    .thread_count = 0,  // 0 = auto-detect CPU count
 });
 defer scheduler.deinit();
+
+try scheduler.spawn(&task);
 ```
 
----
-
-### Synchronization Primitives
-
-```zig
-const zr = @import("zig_routines");
-
-// WaitGroup for coordinating goroutines
-var wg = zr.sync.WaitGroup.init();
-wg.add(3);
-
-// In workers:
-defer wg.done();
-
-// Wait for all:
-wg.wait();
-
-// Mutex with guard
-var mutex = zr.sync.Mutex.init();
-{
-    var guard = mutex.guard();
-    defer guard.release();
-    // Critical section
-}
-
-// Read-write lock
-var rwlock = zr.sync.RwLock.init();
-{
-    var read = rwlock.readGuard();
-    defer read.release();
-    // Multiple readers allowed
-}
-
-// Semaphore
-var sem = try zr.sync.Semaphore.init(allocator, 10);
-defer sem.deinit();
-try sem.acquire();
-defer sem.release();
-
-// Barrier
-var barrier = try zr.sync.Barrier.init(allocator, num_threads);
-defer barrier.deinit();
-try barrier.wait();
-```
+**Implementation**: Each worker has a Chase-Lev deque. Workers pop from their own deque (LIFO for cache locality) and steal from others (FIFO for fairness) when idle.
 
 ---
 
@@ -408,123 +326,33 @@ try barrier.wait();
 
 ```
 src/
-├── root.zig              # Public API
-├── routines.zig          # Runtime
-├── core/                 # Foundation
-│   ├── atomic.zig        # Extended atomics
-│   ├── cache_line.zig    # Cache alignment
-│   └── intrusive.zig     # Intrusive data structures
-├── sync/                 # Synchronization
-│   ├── mutex.zig
-│   ├── rwlock.zig
-│   ├── semaphore.zig
-│   └── wait_group.zig
-├── lockfree/             # Lock-free structures
-│   ├── queue.zig         # MPMC queue
-│   ├── deque.zig         # Work-stealing deque
-│   ├── mpsc.zig          # MPSC queue
-│   ├── spsc.zig          # SPSC ring buffer
-│   └── stack.zig         # Treiber stack
-├── channel/              # CSP channels
-│   ├── bounded.zig
-│   ├── unbounded.zig
-│   ├── oneshot.zig
-│   └── select.zig
-├── future/               # Futures
-│   ├── future.zig
-│   ├── promise.zig
-│   └── combinators.zig
-├── actor/                # Actor model
-│   ├── actor.zig
-│   ├── mailbox.zig
-│   ├── supervisor.zig
-│   └── gen_server.zig
-├── structured/           # Structured concurrency
-│   ├── scope.zig
-│   ├── group.zig
-│   └── cancel.zig
-├── scheduler/            # Schedulers
-│   ├── thread_pool.zig
-│   └── work_stealing.zig
-├── io/                   # Async I/O
-│   ├── io.zig
-│   ├── uring.zig
-│   ├── epoll.zig
-│   ├── kqueue.zig
-│   └── threaded.zig
-└── timer/                # Timers
-    └── timer.zig
+├── core/           # Atomics, cache-line padding, intrusive lists
+├── sync/           # Mutex, RwLock, Semaphore, WaitGroup, Barrier
+├── lockfree/       # MPMC queue, work-stealing deque, SPSC, Treiber stack
+├── channel/        # Bounded, unbounded, oneshot channels
+├── future/         # Futures, promises, combinators
+├── actor/          # Actor, mailbox, supervisor, GenServer
+├── structured/     # Scope, TaskGroup, CancelToken
+├── scheduler/      # ThreadPool, WorkStealingScheduler
+├── io/             # io_uring, kqueue, epoll, threaded backends
+└── timer/          # Timer wheel
 ```
 
 ---
 
 ## Design Principles
 
-### Explicit Memory Management
+**Explicit allocators**: Every function takes an `Allocator`. No global state, no hidden allocations.
 
-Every allocation requires an allocator. No hidden allocations, no global state.
+**Comptime generics**: `Channel(T)` is monomorphized at compile time. No vtables, no boxing, no runtime type info.
 
-```zig
-// You control the allocator
-var ch = try BoundedChannel(T).init(my_allocator, capacity);
-defer ch.deinit();
-```
+**Acquire/Release semantics**: Atomic operations use the weakest sufficient memory ordering. SeqCst only when necessary.
 
-### Zero-Cost Abstractions
-
-Comptime generics eliminate runtime overhead. The channel type is determined at compile time.
+**Cache-aware**: Critical structures use cache-line padding to prevent false sharing:
 
 ```zig
-// No boxing, no vtables, no runtime type info
-const IntChannel = zr.channel.BoundedChannel(i32);
-const StringChannel = zr.channel.BoundedChannel([]const u8);
-```
-
-### Composable Primitives
-
-Build complex patterns from simple pieces:
-
-```zig
-// Combine channels + actors + structured concurrency
-var scope = try Scope.init(allocator, .{});
-defer scope.deinit();
-
-try scope.spawn(producer, .{channel});
-try scope.spawn(actor.ref(), .{});
-try scope.wait();
-```
-
-### Platform-Optimized I/O
-
-Automatically uses the best available backend:
-
-| Platform | Primary  | Fallback |
-| -------- | -------- | -------- |
-| Linux    | io_uring | epoll    |
-| macOS    | kqueue   | threaded |
-| Other    | threaded | —        |
-
----
-
-## Examples
-
-Run the included examples:
-
-```bash
-# Show library info
-zig build run
-
-# Channel example
-zig build basic_channel
-
-# Actor example
-zig build actor_example
-
-# GenServer example
-zig build genserver_example
-
-# Futures example
-zig build futures_example
+enqueue_pos: cache_line.Padded(atomic.Atomic(usize))
+dequeue_pos: cache_line.Padded(atomic.Atomic(usize))
 ```
 
 ---
@@ -532,94 +360,44 @@ zig build futures_example
 ## Testing
 
 ```bash
-# Run all tests
-zig build test
-
-# Run with verbose output
-zig build test --summary all
+zig build test              # Run all 188+ tests
+zig build test --summary all  # Verbose output
 ```
 
-The library includes 188 tests covering all modules.
-
 ---
 
-## Performance Considerations
+## Examples
 
-### Lock-free Structures
-
-- **MPMC Queue**: Based on Vyukov's bounded queue. O(1) push/pop.
-- **Work-stealing Deque**: Chase-Lev algorithm. O(1) push/pop, lock-free steal.
-- **SPSC Ring**: Wait-free for single producer/consumer pairs.
-
-### Cache Optimization
-
-- Cache-line padding prevents false sharing
-- Contiguous memory layouts for cache locality
-- Intrusive data structures avoid pointer chasing
-
-### Memory Ordering
-
-- Acquire/Release semantics where possible
-- SeqCst only when necessary for correctness
-- Explicit ordering in all atomic operations
-
----
-
-## Comparison
-
-| Feature                | zig-routines | Go  | Tokio (Rust) | Erlang/OTP         |
-| ---------------------- | ------------ | --- | ------------ | ------------------ |
-| Channels               | ✅           | ✅  | ✅           | ✅ (via processes) |
-| Futures                | ✅           | ❌  | ✅           | ❌                 |
-| Actors                 | ✅           | ❌  | ✅ (Actix)   | ✅                 |
-| Supervision            | ✅           | ❌  | ❌           | ✅                 |
-| GenServer              | ✅           | ❌  | ❌           | ✅                 |
-| Structured Concurrency | ✅           | ❌  | ✅           | ❌                 |
-| Work-stealing          | ✅           | ✅  | ✅           | ✅                 |
-| Explicit Allocators    | ✅           | ❌  | ❌           | ❌                 |
-| io_uring               | ✅           | ❌  | ✅           | ❌                 |
-| No Runtime             | ✅           | ❌  | ❌           | ❌                 |
+```bash
+zig build run               # Library info
+zig build basic_channel     # Channel demo
+zig build actor_example     # Actor lifecycle
+zig build genserver_example # Request-response server
+zig build futures_example   # Promises and combinators
+```
 
 ---
 
 ## Requirements
 
 - **Zig**: 0.15.x or later
-- **Platforms**: Linux (x86_64, aarch64), macOS (aarch64, x86_64)
+- **Linux**: x86_64, aarch64 (io_uring requires kernel 5.1+)
+- **macOS**: aarch64, x86_64
 
 ---
 
-## Contributing
+## Acknowledgments
 
-Contributions are welcome! Please:
+Built with techniques from:
 
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass (`zig build test`)
-5. Submit a pull request
+- Dmitry Vyukov's bounded MPMC queue
+- Chase-Lev work-stealing deque
+- Treiber stack
+- OTP supervision patterns (adapted for OS threads)
+- Swift structured concurrency model
 
 ---
 
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
-
----
-
-## Acknowledgments
-
-Inspired by:
-
-- Go's goroutines and channels
-- Erlang/OTP's actor model and supervision
-- Rust's futures and Tokio
-- Swift's structured concurrency
-- Python Trio's nurseries
-- Java's ForkJoinPool
-
----
-
-<p align="center">
-  <strong>Build concurrent systems with confidence.</strong>
-</p>
